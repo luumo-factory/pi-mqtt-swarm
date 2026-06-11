@@ -233,7 +233,28 @@ export default function (pi: ExtensionAPI) {
 		pi.sendUserMessage(text); // idle -> triggers a fresh turn
 	};
 
+	// A slash command is a single-line message whose first non-whitespace
+	// character is "/". pi only recognizes a command when the "/" leads the
+	// input, so such messages must be delivered verbatim — never wrapped (e.g.
+	// "[URGENT] …") or batched into a numbered list, or pi would treat them as
+	// plain prose for the LLM instead of executing the command.
+	const isSlashCommand = (text: string) => {
+		const t = text.trim();
+		return t.startsWith("/") && !/[\r\n]/.test(t);
+	};
+
+	// Deliver a slash command verbatim. Mid-stream it's queued as a followUp
+	// (commands can't be steered); idle, it runs immediately and triggers a turn.
+	const deliverCommand = (text: string) => {
+		pi.sendUserMessage(text.trim(), busy ? { deliverAs: "followUp" } : undefined);
+	};
+
 	const enqueue = (text: string, urgent: boolean) => {
+		// Slash commands bypass wrapping/batching so pi runs them as commands.
+		if (isSlashCommand(text)) {
+			deliverCommand(text);
+			return;
+		}
 		if (urgent) {
 			// Deliver now; steer if mid-stream, otherwise it triggers a turn.
 			pi.sendUserMessage(`[URGENT] ${text}`, busy ? { deliverAs: "steer" } : undefined);
@@ -245,9 +266,7 @@ export default function (pi: ExtensionAPI) {
 
 	// Invoke one of our own slash commands as a user message (documented pattern
 	// for reaching command-only context like newSession/reload from elsewhere).
-	const invokeCommand = (name: string) => {
-		pi.sendUserMessage(`/${name}`, busy ? { deliverAs: "followUp" } : undefined);
-	};
+	const invokeCommand = (name: string) => deliverCommand(`/${name}`);
 
 	// -----------------------------------------------------------------------
 	// Board helpers

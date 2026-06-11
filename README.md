@@ -215,6 +215,12 @@ All inbound work funnels through one queue:
   one turn.
 - **Urgent** (`/interrupt`, or board posts with `urgent: true`) is delivered
   immediately — steered into a running turn or starting a new one if idle.
+- **Slash commands** — a single-line message whose first non-whitespace
+  character is `/` (e.g. `/model anthropic/claude-sonnet-4-5`, `/compact`) is
+  detected on either channel and delivered **verbatim** so pi executes it as a
+  command. Such messages are never wrapped (no `[URGENT]` prefix) or coalesced
+  into a batch, since pi only recognizes a command when the `/` leads the input.
+  Mid-stream they're queued as a follow-up (commands can't be steered).
 
 This is the "pull on idle, separate interrupt channel" design: MQTT does the
 inter-process delivery and offline queueing (persistent session, QoS 1); the
