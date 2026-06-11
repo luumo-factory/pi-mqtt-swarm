@@ -5,10 +5,10 @@
   "license": "MIT",
   "type": "module",
   "bin": {
-    "pi-swarm-console": "./src/console.ts"
+    "pi-swarm-console": "./console.ts"
   },
   "scripts": {
-    "console": "node src/console.ts",
+    "console": "node console.ts",
     "typecheck": "tsc --noEmit"
   },
   "keywords": [
@@ -25,7 +25,7 @@
   },
   "pi": {
     "extensions": [
-      "./src/index.ts"
+      "./index.ts"
     ]
   },
   "dependencies": {

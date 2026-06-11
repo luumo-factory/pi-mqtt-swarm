@@ -28,7 +28,7 @@ Requires an MQTT broker (e.g. [Mosquitto](https://mosquitto.org/)).
 pi install git:github.com/luumo-factory/pi-mqtt-swarm
 
 # Or load locally during development
-pi -e /path/to/pi-mqtt-swarm/src/index.ts --swarm-name coder-1
+pi -e /path/to/pi-mqtt-swarm/index.ts --swarm-name coder-1
 ```
 
 When installed as a package, declare the broker/name via env or the
@@ -46,6 +46,7 @@ PI_SWARM_BROKER=mqtt://127.0.0.1:1883 pi --swarm-name reviewer
 | name | `--swarm-name` flag / `PI_SWARM_NAME` / pi `--name` | `agent-<pid>` | Human label; also names the session. Slugified into the agent id used in topics. Resolution priority: `--swarm-name` > `PI_SWARM_NAME` > pi session name (`--name`) > default. |
 | broker | `PI_SWARM_BROKER` / `MQTT_URL` | `mqtt://127.0.0.1:1883` | MQTT broker URL. |
 | namespace | `PI_SWARM_NS` | `swarm` | Root of all topics. |
+| group | `PI_SWARM_GROUP` | `red` | Initial colour-coded group; selects the board topic the agent binds to. Changeable at runtime via the `set_group` control action. |
 
 > Give each agent a **unique** name — the id (slug of the name) is used in
 > topic paths, so duplicate names collide.
@@ -66,7 +67,8 @@ planes: a **work/data plane** (`in` / `interrupt` / `out`) and a dedicated
 | `NS/agents/ID/out` | agent → orch | – | work event stream (locally-typed user input `{ type:"user_input", text, source }`, agent/turn summaries, session reset/reload) |
 | `NS/agents/ID/control/in` | orch → agent | – | `{ action, ... }` control commands (see below) |
 | `NS/agents/ID/control/out` | agent → orch | – | control replies (acks, results, model/extension/tool state) |
-| `NS/board` | any → all | – | `{ seq, from:{id,name}, text, urgent, ts }` |
+| `NS/board` | any → all | ✅ | `{ seq, from:{id,name}, text, urgent, ts }` — default `red` group board |
+| `NS/board/<group>` | any → all | ✅ | per-group board (`orange`…`pink`); each agent binds to its group's board only |
 
 > **Two kinds of "interrupt":** `NS/agents/ID/interrupt` *injects* an urgent
 > message into the running turn (steering). The control action `abort` (below)
@@ -96,6 +98,9 @@ tools it registered.)
 { "action": "set_model", "provider": "anthropic",     // switch model (explicit)
   "modelId": "claude-sonnet-4-5" }
 { "action": "set_model", "query": "gpt-4o" }          // switch model (fuzzy)
+
+// Group (colour-coded board membership)
+{ "action": "set_group", "group": "blue" }            // re-bind to that group's board topic
 
 // Interrupt the running turn
 { "action": "abort" }                                 // alias: "interrupt"
@@ -132,7 +137,7 @@ display name while keeping the id/topics stable.
 
 ## Spawn console
 
-The **console** (`src/console.ts`) is a separate, long-running process — not a pi
+The **console** (`console.ts`) is a separate, long-running process — not a pi
 extension — that lets an orchestrator spawn and shut down headless agents over
 MQTT. It listens on a dedicated spawn channel, forks `pi --mode rpc` processes
 (always loading the swarm extension so the new agent joins the swarm), tracks
@@ -141,7 +146,7 @@ driven entirely over MQTT by the extension.
 
 ```bash
 # Run it (Node 24+ runs the .ts file directly)
-node src/console.ts --name host-1 --broker mqtt://127.0.0.1:1883
+node console.ts --name host-1 --broker mqtt://127.0.0.1:1883
 # or
 npm run console -- --name host-1
 ```
@@ -217,11 +222,22 @@ All inbound work funnels through one queue:
 - **Urgent** (`/interrupt`, or board posts with `urgent: true`) is delivered
   immediately — steered into a running turn or starting a new one if idle.
 - **Slash commands** — a single-line message whose first non-whitespace
-  character is `/` (e.g. `/model anthropic/claude-sonnet-4-5`, `/compact`) is
-  detected on either channel and delivered **verbatim** so pi executes it as a
-  command. Such messages are never wrapped (no `[URGENT]` prefix) or coalesced
-  into a batch, since pi only recognizes a command when the `/` leads the input.
-  Mid-stream they're queued as a follow-up (commands can't be steered).
+  character is `/` is detected on either channel and **interpreted by the
+  extension itself**, then mapped to the matching pi API call. Injected text is
+  *not* handed to pi to parse: `pi.sendUserMessage()` routes through
+  `prompt({ expandPromptTemplates: false })`, which deliberately skips command
+  handling, and built-ins (`/quit`, `/new`, `/compact`, …) are handled by the
+  TUI input layer rather than the agent session — so delivering `/quit` as a
+  message would just send the literal text to the model. Supported commands:
+  `/quit` `/exit` `/shutdown` → `ctx.shutdown()`; `/compact` → `ctx.compact()`;
+  `/stop` `/abort` `/cancel` `/interrupt` → `ctx.abort()`; `/status` →
+  re-publish registration; `/reset` `/new` `/clear` → new session; `/reload` →
+  reload runtime. Anything unrecognized falls through to normal delivery as
+  prose. **Note:** `newSession()`/`reload()` are only exposed on the *command*
+  context pi builds for command handlers, not on the event/tool context the
+  extension holds, so the programmatic `/reset` and `/reload` paths no-op (with
+  a TUI notice) unless a future pi exposes those on the base context — run
+  `/swarm-reset` / `/swarm-reload` in the TUI instead.
 
 This is the "pull on idle, separate interrupt channel" design: MQTT does the
 inter-process delivery and offline queueing (persistent session, QoS 1); the

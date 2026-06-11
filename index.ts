@@ -18,14 +18,20 @@
  *   PI_SWARM_NAME           Same as --swarm-name (flag wins).
  *   PI_SWARM_BROKER / MQTT_URL   Broker URL (default mqtt://127.0.0.1:1883).
  *   PI_SWARM_NS             Topic namespace root (default "swarm").
+ *   PI_SWARM_GROUP          Initial colour-coded group (default "red").
  *
  * Topic map (NS = namespace, ID = slugified agent id):
  *   NS/registry/ID            (retained) registration + live overview + LWT
  *   NS/agents/ID/in           inbound normal work  -> queued, delivered when idle
  *   NS/agents/ID/interrupt    inbound urgent work  -> delivered immediately
- *   NS/agents/ID/control      inbound control { action: set_model|reset|reload|ping }
+ *   NS/agents/ID/control      inbound control { action: set_model|set_group|reset|reload|ping }
  *   NS/agents/ID/out          outbound events (locally-typed user input, turn/agent summaries, results, acks)
- *   NS/board                  shared broadcast board (all agents subscribe)
+ *   NS/board                  shared broadcast board for the default "red" group
+ *   NS/board/<group>          per-group board (orange|yellow|green|cyan|blue|purple|pink)
+ *
+ * Agents belong to one of eight colour-coded groups (default "red", overridable
+ * via PI_SWARM_GROUP) and subscribe to their group's board only. A `set_group`
+ * control message re-binds the agent to a different group's board topic.
  */
 
 import mqtt, { type MqttClient } from "mqtt";
@@ -39,6 +45,23 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 const NS = process.env.PI_SWARM_NS ?? "swarm";
 const BROKER = process.env.PI_SWARM_BROKER ?? process.env.MQTT_URL ?? "mqtt://127.0.0.1:1883";
 const BOARD_HISTORY_MAX = 100;
+
+// Colour-coded groups that share a per-group board. New agents default to "red".
+const GROUPS = ["red", "orange", "yellow", "green", "cyan", "blue", "purple", "pink"] as const;
+type Group = (typeof GROUPS)[number];
+
+function normalizeGroup(raw: string | undefined | null): Group {
+	const g = String(raw ?? "").trim().toLowerCase();
+	return (GROUPS as readonly string[]).includes(g) ? (g as Group) : "red";
+}
+
+// Board topic for a group: the default "red" group keeps the legacy NS/board
+// topic; every other group uses NS/board/<group>.
+function boardTopic(ns: string, group: Group): string {
+	return group === "red" ? `${ns}/board` : `${ns}/board/${group}`;
+}
+
+const DEFAULT_GROUP = normalizeGroup(process.env.PI_SWARM_GROUP);
 
 function slug(s: string): string {
 	return (
@@ -67,7 +90,7 @@ function lastAssistantText(messages: any[]): string | null {
 	return null;
 }
 
-function topicsFor(ns: string, id: string) {
+function topicsFor(ns: string, id: string, group: Group = "red") {
 	return {
 		registry: `${ns}/registry/${id}`,
 		// Work / data plane
@@ -77,7 +100,8 @@ function topicsFor(ns: string, id: string) {
 		// Control plane (dedicated in/out pair)
 		controlIn: `${ns}/agents/${id}/control/in`,
 		controlOut: `${ns}/agents/${id}/control/out`,
-		board: `${ns}/board`,
+		// Board for this agent's current group.
+		board: boardTopic(ns, group),
 	};
 }
 
@@ -105,7 +129,8 @@ export default function (pi: ExtensionAPI) {
 	// not yet applied while the extension factory runs.
 	let NAME = `agent-${process.pid}`;
 	let ID = slug(NAME);
-	let T = topicsFor(NS, ID);
+	let GROUP: Group = DEFAULT_GROUP;
+	let T = topicsFor(NS, ID, GROUP);
 	let identityResolved = false;
 
 	const resolveIdentity = () => {
@@ -120,7 +145,7 @@ export default function (pi: ExtensionAPI) {
 		if (rawName) {
 			NAME = rawName;
 			ID = slug(rawName);
-			T = topicsFor(NS, ID);
+			T = topicsFor(NS, ID, GROUP);
 		}
 		identityResolved = true;
 	};
@@ -134,8 +159,10 @@ export default function (pi: ExtensionAPI) {
 	let modelRegistry: any = null; // captured from latest session ctx
 	let availableModels: { provider: string; id: string; name?: string }[] = [];
 	let lastCtx: any = null; // most recent context, used for ctx.abort()
+	let nameWatch: ReturnType<typeof setInterval> | null = null; // polls /name changes
 	const queue: string[] = []; // normal inbound, awaiting idle
 	const board: BoardPost[] = []; // local mirror of board history
+	const seenBoard = new Set<string>(); // dedup key: `${from.id}#${seq}`
 	let boardSeq = 0;
 	const startedAt = Date.now();
 
@@ -189,6 +216,7 @@ export default function (pi: ExtensionAPI) {
 				id: ID,
 				name: NAME,
 				status,
+				group: GROUP,
 				model,
 				availableModels,
 				extensions: listExtensions(),
@@ -215,7 +243,7 @@ export default function (pi: ExtensionAPI) {
 	const updateStatusLine = (ctx: any) => {
 		if (!ctx?.hasUI) return;
 		const m = model?.name ?? model?.id ?? "no-model";
-		ctx.ui.setStatus?.("swarm", `swarm:${NAME}${busy ? " ⋅ busy" : ""} ⋅ ${m}`);
+		ctx.ui.setStatus?.("swarm", `swarm:${NAME}${busy ? " ⋅ busy" : ""} ⋅ ${m} ⋅ board:${GROUP}`);
 	};
 
 	// -----------------------------------------------------------------------
@@ -269,23 +297,137 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	// A slash command is a single-line message whose first non-whitespace
-	// character is "/". pi only recognizes a command when the "/" leads the
-	// input, so such messages must be delivered verbatim — never wrapped (e.g.
-	// "[URGENT] …") or batched into a numbered list, or pi would treat them as
-	// plain prose for the LLM instead of executing the command.
+	// character is "/".
 	const isSlashCommand = (text: string) => {
 		const t = text.trim();
 		return t.startsWith("/") && !/[\r\n]/.test(t);
 	};
 
-	// Deliver a slash command verbatim. Mid-stream it's queued as a followUp
-	// (commands can't be steered); idle, it runs immediately and triggers a turn.
-	const deliverCommand = (text: string) => deliver(text.trim(), "followUp");
+	// Surface a short notice in the TUI when one is attached; stay silent in
+	// headless/RPC runs so we never corrupt non-interactive output.
+	const notify = (msg: string, level: "info" | "warning" = "info") => {
+		try {
+			if (lastCtx?.hasUI) lastCtx.ui.notify(msg, level);
+		} catch {
+			/* ignore */
+		}
+	};
+
+	// Graceful shutdown, equivalent to the in-TUI /quit command. /quit is a
+	// built-in handled by the TUI input layer, and ctx.shutdown() triggers the
+	// exact same path, so we call it directly instead of injecting "/quit".
+	const gracefulShutdown = () => {
+		// Clear our retained registry up front so peers see us go offline
+		// immediately, regardless of which exit path completes first.
+		try {
+			client?.publish(
+				T.registry,
+				JSON.stringify({ id: ID, name: NAME, status: "offline", ts: Date.now() }),
+				{ qos: 1, retain: true },
+			);
+		} catch {
+			/* ignore */
+		}
+		// Trigger the same graceful path as the in-TUI /quit when available.
+		try {
+			lastCtx?.shutdown?.();
+		} catch {
+			/* ignore */
+		}
+		// Guaranteed termination. ctx.shutdown() is deferred until the agent is
+		// idle, and in headless mode the live MQTT client keeps the Node event loop
+		// alive, so a remote quit would never actually exit the process. Force a
+		// hard exit as a backstop after giving the offline publish time to flush.
+		setTimeout(() => {
+			try {
+				client?.end(true);
+			} catch {
+				/* ignore */
+			}
+			process.exit(0);
+		}, 500).unref?.();
+	};
+
+	// Reset (new session) and reload need the *command* context pi builds only for
+	// command handlers; newSession()/reload() are not exposed on the event/tool
+	// context we hold here. We keep /swarm-reset and /swarm-reload registered so a
+	// human can run them in the TUI; programmatically we call the methods when
+	// present and otherwise report that the action is unavailable.
+	const resetSession = () => {
+		pub(T.out, { type: "session_reset", id: ID, ts: Date.now() });
+		if (typeof lastCtx?.newSession === "function") {
+			void lastCtx.newSession();
+		} else {
+			notify("swarm: /reset needs a command context; run /swarm-reset in the TUI", "warning");
+		}
+	};
+	const reloadRuntime = () => {
+		pub(T.out, { type: "reloading", id: ID, ts: Date.now() });
+		if (typeof lastCtx?.reload === "function") {
+			void lastCtx.reload();
+		} else {
+			notify("swarm: /reload needs a command context; run /swarm-reload in the TUI", "warning");
+		}
+	};
+
+	// pi never parses slash commands delivered via sendUserMessage():
+	// sendUserMessage() routes through prompt({ expandPromptTemplates: false }),
+	// which deliberately skips command handling, and built-ins (/quit, /new,
+	// /compact, …) are handled by the TUI input layer rather than the agent
+	// session. So we interpret the commands we support here and call the matching
+	// ExtensionContext method. Returns true when the command was handled.
+	const dispatchSlashCommand = (raw: string): boolean => {
+		const body = raw.trim().replace(/^\/+/, "");
+		const sp = body.search(/\s/);
+		const name = (sp === -1 ? body : body.slice(0, sp)).toLowerCase();
+		switch (name) {
+			case "quit":
+			case "exit":
+			case "shutdown":
+				gracefulShutdown();
+				return true;
+			case "compact":
+				try {
+					lastCtx?.compact?.();
+				} catch {
+					/* ignore */
+				}
+				return true;
+			case "stop":
+			case "abort":
+			case "cancel":
+			case "interrupt":
+				try {
+					lastCtx?.abort?.();
+				} catch {
+					/* ignore */
+				}
+				return true;
+			case "status":
+			case "swarm-status":
+				publishRegistry(busy ? "busy" : "online");
+				notify(`swarm ${NAME} (${ID}) -> ${BROKER}`, "info");
+				return true;
+			case "reset":
+			case "new":
+			case "clear":
+			case "swarm-reset":
+				resetSession();
+				return true;
+			case "reload":
+			case "swarm-reload":
+				reloadRuntime();
+				return true;
+			default:
+				return false;
+		}
+	};
 
 	const enqueue = (text: string, urgent: boolean) => {
-		// Slash commands bypass wrapping/batching so pi runs them as commands.
-		if (isSlashCommand(text)) {
-			deliverCommand(text);
+		// Slash commands can't be parsed by pi when injected programmatically, so
+		// interpret the ones we support ourselves. Anything unrecognized falls
+		// through to normal (wrapped/batched) delivery as prose.
+		if (isSlashCommand(text) && dispatchSlashCommand(text)) {
 			return;
 		}
 		if (urgent) {
@@ -297,16 +439,22 @@ export default function (pi: ExtensionAPI) {
 		if (!agentStreaming()) flush();
 	};
 
-	// Invoke one of our own slash commands as a user message (documented pattern
-	// for reaching command-only context like newSession/reload from elsewhere).
-	const invokeCommand = (name: string) => deliverCommand(`/${name}`);
-
 	// -----------------------------------------------------------------------
 	// Board helpers
 	// -----------------------------------------------------------------------
-	const recordBoard = (post: BoardPost) => {
+	// Returns true when the post is new (not seen before). Dedup is keyed by
+	// sender id + per-sender seq so a post that arrives both live and again via
+	// the retained topic / queued persistent session is only recorded once.
+	const recordBoard = (post: BoardPost): boolean => {
+		const key = `${post.from?.id}#${post.seq}`;
+		if (seenBoard.has(key)) return false;
+		seenBoard.add(key);
 		board.push(post);
-		if (board.length > BOARD_HISTORY_MAX) board.splice(0, board.length - BOARD_HISTORY_MAX);
+		if (board.length > BOARD_HISTORY_MAX) {
+			const dropped = board.splice(0, board.length - BOARD_HISTORY_MAX);
+			for (const d of dropped) seenBoard.delete(`${d.from?.id}#${d.seq}`);
+		}
+		return true;
 	};
 
 	// -----------------------------------------------------------------------
@@ -361,7 +509,7 @@ export default function (pi: ExtensionAPI) {
 		if (idChanged) {
 			const oldRegistry = T.registry;
 			ID = newId;
-			T = topicsFor(NS, ID);
+			T = topicsFor(NS, ID, GROUP);
 			// Delete the stale retained registry entry under the old id (empty
 			// retained payload), then reconnect so the new id is fully wired up.
 			try {
@@ -375,6 +523,20 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (lastCtx) updateStatusLine(lastCtx);
 		return { ok: true as const, name: NAME, id: ID, idChanged, previous };
+	};
+
+	// The in-TUI `/name` command calls setSessionName() directly and does not emit
+	// an extension event, so the swarm NAME (and therefore the registry the GUI
+	// reads) would otherwise go stale. Poll the session name and, when an operator
+	// changes it locally, mirror it as a display-only rename (id/topics stay put)
+	// so the new label propagates to peers and the GUI.
+	const syncSessionName = () => {
+		const current = pi.getSessionName?.();
+		if (!current || current === NAME) return;
+		const result = renameAgent(current, false);
+		if (result.ok) {
+			reply({ type: "rename_result", ...result, source: "local-name-command" });
+		}
 	};
 
 	const handleControl = async (msg: any) => {
@@ -486,41 +648,68 @@ export default function (pi: ExtensionAPI) {
 					type: "rename_ack",
 					request: { name: wantName, reslug },
 					newId: predictedId,
-					newTopics: topicsFor(NS, predictedId),
+					newTopics: topicsFor(NS, predictedId, GROUP),
 				});
 				const result = renameAgent(wantName, reslug);
 				reply({ type: "rename_result", ...result });
 				return;
 			}
 
+			case "set_group": {
+				// Move this agent to a colour-coded group: unbind the old board topic,
+				// rebind the new one, and re-publish the registry so the GUI reflects it.
+				// This is the control message the GUI sends to point us at a different
+				// colour board; both our subscription and our posts (T.board) follow it.
+				const next = normalizeGroup(msg.group);
+				if (next === GROUP) {
+					notify(`swarm: already listening to '${GROUP}' board (${T.board})`, "info");
+					reply({ type: "group", ok: true, group: GROUP, changed: false, board: T.board });
+					publishRegistry(busy ? "busy" : "online");
+					return;
+				}
+				const prevGroup = GROUP;
+				const oldBoard = T.board;
+				GROUP = next;
+				T = topicsFor(NS, ID, GROUP);
+				try {
+					if (oldBoard !== T.board) {
+						client?.unsubscribe(oldBoard);
+						client?.subscribe(T.board, { qos: 1 });
+					}
+				} catch {
+					/* best effort; reconnect would re-derive subscriptions anyway */
+				}
+				// The new board is a different conversation: drop the old mirror so
+				// read_board reflects the group we're now listening to.
+				board.length = 0;
+				seenBoard.clear();
+				publishRegistry(busy ? "busy" : "online");
+				if (lastCtx) updateStatusLine(lastCtx);
+				// Surface the switch in the TUI/message log so the operator can see we
+				// are now reading from (and posting to) a different colour board.
+				notify(
+					`swarm: switched board ${prevGroup} → ${GROUP}; now listening to and posting on ${T.board}`,
+					"info",
+				);
+				reply({ type: "group", ok: true, group: GROUP, changed: true, board: T.board, previousGroup: prevGroup });
+				return;
+			}
+
 			case "reset":
 				reply({ type: "ack", action: "reset" });
-				invokeCommand("swarm-reset");
+				resetSession();
 				return;
 
 			case "reload":
 				reply({ type: "ack", action: "reload" });
-				invokeCommand("swarm-reload");
+				reloadRuntime();
 				return;
 
 			case "quit":
 			case "shutdown": {
 				// Graceful shutdown, equivalent to the in-TUI /quit command.
 				reply({ type: "ack", action: "quit" });
-				if (typeof lastCtx?.shutdown === "function") {
-					lastCtx.shutdown();
-				} else {
-					// No context yet: clear our retained registry and exit directly.
-					try {
-						client?.publish(T.registry, JSON.stringify({ id: ID, name: NAME, status: "offline", ts: Date.now() }), {
-							qos: 1,
-							retain: true,
-						});
-					} catch {
-						/* ignore */
-					}
-					setTimeout(() => process.exit(0), 100).unref?.();
-				}
+				gracefulShutdown();
 				return;
 			}
 
@@ -534,7 +723,11 @@ export default function (pi: ExtensionAPI) {
 	// -----------------------------------------------------------------------
 	const connect = (ctx: any) => {
 		client = mqtt.connect(BROKER, {
-			clientId: `pi-${ID}-${process.pid}`,
+			// Stable clientId (no pid): a restarted agent resumes the SAME persistent
+			// session, so the broker delivers QoS1 work (incl. board posts) that
+			// arrived while it was down. Including the pid here created a fresh
+			// session on every restart and silently dropped all queued messages.
+			clientId: `pi-${ID}`,
 			clean: false, // persistent session: broker queues QoS1 work while we're away
 			reconnectPeriod: 2000,
 			will: {
@@ -563,7 +756,17 @@ export default function (pi: ExtensionAPI) {
 			if (topic === T.board) {
 				if (!msg || typeof msg.seq !== "number") return;
 				if (msg.from?.id === ID) return; // ignore our own broadcast echo
-				recordBoard(msg as BoardPost);
+				// Only notify on genuinely new posts. Retained + queued (persistent
+				// session) delivery can replay the same post; dedup avoids double-
+				// surfacing it to the agent.
+				if (!recordBoard(msg as BoardPost)) return;
+				// Don't re-read the historical board on startup. Retained + persistent-
+				// session (clean:false) delivery replays posts that predate this launch;
+				// surfacing them would spam the agent (and trigger "already processing a
+				// prompt" errors before the first turn settles). Such posts stay in the
+				// local mirror above so read_board still shows history — we just never
+				// enqueue them as new work. Only posts broadcast after we launched flow on.
+				if (typeof msg.ts === "number" && msg.ts < startedAt) return;
 				enqueue(
 					`[BOARD] ${msg.from?.name ?? "peer"} broadcast: ${msg.text}`,
 					Boolean(msg.urgent),
@@ -638,7 +841,9 @@ export default function (pi: ExtensionAPI) {
 				urgent: Boolean(params.urgent),
 				ts: Date.now(),
 			};
-			pub(T.board, post, { qos: 1 });
+			// retain: a freshly-spawned/late agent gets the latest board state the
+			// moment it subscribes, instead of only seeing posts made after it joined.
+			pub(T.board, post, { qos: 1, retain: true });
 			recordBoard(post); // keep in our own history for read_board continuity
 			return { content: [{ type: "text", text: `Broadcast to swarm board (#${post.seq}).` }], details: { seq: post.seq } };
 		},
@@ -696,13 +901,25 @@ export default function (pi: ExtensionAPI) {
 		modelRegistry = ctx.modelRegistry ?? null;
 		const m = ctx.model;
 		model = m ? { provider: m.provider, id: m.id, name: m.name } : model;
-		if (pi.getSessionName?.() == null) pi.setSessionName?.(NAME);
+		// Establish a consistent baseline: NAME is the canonical swarm label
+		// (flag/env/session-name/default), so pin the session name to it. Without
+		// this, a flag/env name that differs from a pre-existing session name would
+		// be reverted by the /name watcher below.
+		pi.setSessionName?.(NAME);
 		await refreshAvailableModels(); // populate before the first registry publish
 		connect(ctx);
 		updateStatusLine(ctx);
+		// Watch for in-TUI `/name` changes (no event is emitted for those).
+		if (nameWatch) clearInterval(nameWatch);
+		nameWatch = setInterval(syncSessionName, 1500);
+		(nameWatch as any).unref?.();
 	});
 
 	pi.on("session_shutdown", async () => {
+		if (nameWatch) {
+			clearInterval(nameWatch);
+			nameWatch = null;
+		}
 		publishRegistry("offline");
 		try {
 			client?.end(false);

@@ -13,9 +13,9 @@
  * (inbound work, control, board). The console never needs to feed RPC commands.
  *
  * Run it:
- *   node src/console.ts                       # uses env defaults
- *   node src/console.ts --name host-1 --broker mqtt://127.0.0.1:1883
- *   PI_SWARM_BROKER=... PI_SWARM_NS=... node src/console.ts
+ *   node console.ts                       # uses env defaults
+ *   node console.ts --name host-1 --broker mqtt://127.0.0.1:1883
+ *   PI_SWARM_BROKER=... PI_SWARM_NS=... node console.ts
  *
  * Configuration (env + CLI flag; flag wins):
  *   --broker <url>     PI_SWARM_BROKER / MQTT_URL  (default mqtt://127.0.0.1:1883)
@@ -23,6 +23,7 @@
  *   --name <name>      PI_SWARM_CONSOLE_NAME        (default console-<host>-<pid>)
  *   --pi <bin>         PI_BIN                       (default "pi")
  *   --extension <path> PI_SWARM_EXTENSION           (default ./index.ts beside this file)
+ *   --verbose          PI_SWARM_CONSOLE_VERBOSE     (default off; echo agents' raw RPC stdout)
  *
  * Topic map (NS = namespace):
  *   NS/console/in              inbound console commands { action, ... }
@@ -85,6 +86,12 @@ function slug(s: string): string {
 }
 
 const CONSOLE_NAME = ARGS.name ?? process.env.PI_SWARM_CONSOLE_NAME ?? `console-${hostname()}-${process.pid}`;
+
+// When set, log the spawned agents' raw stdout (RPC JSON-RPC frames) and stderr.
+// Off by default: in RPC mode stdout is a firehose of JSON the console doesn't
+// need, so we just drain it. Genuine startup errors on stderr are still logged.
+const VERBOSE =
+	ARGS.verbose === "true" || /^(1|true|yes)$/i.test(process.env.PI_SWARM_CONSOLE_VERBOSE ?? "");
 const CONSOLE_ID = slug(CONSOLE_NAME);
 
 const T = {
@@ -251,7 +258,14 @@ function handleSpawn(req: any) {
 	};
 	agents.set(finalId, agent);
 
-	child.stdout?.on("data", (b) => log(`[${finalId}:out]`, b.toString().trimEnd()));
+	// In RPC mode stdout carries the JSON-RPC stream the console doesn't consume;
+	// drain it (and stderr) so the pipe buffer can't fill and block the child.
+	// Only echo it when explicitly running verbose. stderr is always surfaced.
+	if (VERBOSE) {
+		child.stdout?.on("data", (b) => log(`[${finalId}:out]`, b.toString().trimEnd()));
+	} else {
+		child.stdout?.resume();
+	}
 	child.stderr?.on("data", (b) => log(`[${finalId}:err]`, b.toString().trimEnd()));
 
 	child.on("error", (err) => {
