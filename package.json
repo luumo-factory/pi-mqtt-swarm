@@ -3,6 +3,14 @@
   "version": "0.2.0",
   "description": "Coordinate a swarm of pi coding agents over MQTT: central orchestration, per-agent in/out queues, status overview, a shared message board, and remote model/reset/reload control.",
   "license": "MIT",
+  "type": "module",
+  "bin": {
+    "pi-swarm-console": "./src/console.ts"
+  },
+  "scripts": {
+    "console": "node src/console.ts",
+    "typecheck": "tsc --noEmit"
+  },
   "keywords": [
     "pi-package",
     "pi",

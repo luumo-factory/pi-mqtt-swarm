@@ -43,7 +43,7 @@ PI_SWARM_BROKER=mqtt://127.0.0.1:1883 pi --swarm-name reviewer
 
 | Setting | Source | Default | Purpose |
 |---------|--------|---------|---------|
-| name | `--swarm-name` flag / `PI_SWARM_NAME` | `agent-<pid>` | Human label; also names the session. Slugified into the agent id used in topics. |
+| name | `--swarm-name` flag / `PI_SWARM_NAME` / pi `--name` | `agent-<pid>` | Human label; also names the session. Slugified into the agent id used in topics. Resolution priority: `--swarm-name` > `PI_SWARM_NAME` > pi session name (`--name`) > default. |
 | broker | `PI_SWARM_BROKER` / `MQTT_URL` | `mqtt://127.0.0.1:1883` | MQTT broker URL. |
 | namespace | `PI_SWARM_NS` | `swarm` | Root of all topics. |
 
@@ -63,7 +63,7 @@ planes: a **work/data plane** (`in` / `interrupt` / `out`) and a dedicated
 | `NS/registry/ID` | agent → all | ✅ + LWT | `{ id, name, status, model, availableModels, extensions, tools, pid, cwd, startedAt, ts }` |
 | `NS/agents/ID/in` | orch → agent | – | `{ text }` or raw string — **queued, delivered when idle** |
 | `NS/agents/ID/interrupt` | orch → agent | – | `{ text }` or raw string — urgent message **injected immediately** (steers the turn) |
-| `NS/agents/ID/out` | agent → orch | – | work event stream (agent/turn summaries, session reset/reload) |
+| `NS/agents/ID/out` | agent → orch | – | work event stream (locally-typed user input `{ type:"user_input", text, source }`, agent/turn summaries, session reset/reload) |
 | `NS/agents/ID/control/in` | orch → agent | – | `{ action, ... }` control commands (see below) |
 | `NS/agents/ID/control/out` | agent → orch | – | control replies (acks, results, model/extension/tool state) |
 | `NS/board` | any → all | – | `{ seq, from:{id,name}, text, urgent, ts }` |
@@ -111,9 +111,94 @@ tools it registered.)
 // Session lifecycle
 { "action": "reset" }                                 // fresh conversation/context
 { "action": "reload" }                                // reload extensions/skills/etc
+
+// Rename this agent (alias: "set_name")
+{ "action": "rename", "name": "coder-2" }             // rename + reslug id/topics (default)
+{ "action": "rename", "name": "Coder Two",            // rename display name only,
+  "reslug": false }                                   //   keep existing id/topics
 ```
 
 Replies are published to `NS/agents/ID/control/out`.
+
+A `rename` updates both the swarm `name` and the pi session name. By default it
+re-derives the agent **id** from the new name, which moves all `NS/agents/ID/*`
+topics: the agent clears its old retained registry, reconnects (so its Last-Will
+binds to the new id), and re-subscribes. Because the topics move, the agent first
+emits a `rename_ack` (with the predicted `newId` + `newTopics`) on the **current**
+`control/out`, then publishes the final `rename_result` on the **new**
+`control/out` — resubscribe accordingly. Pass `"reslug": false` to change only the
+display name while keeping the id/topics stable.
+
+## Spawn console
+
+The **console** (`src/console.ts`) is a separate, long-running process — not a pi
+extension — that lets an orchestrator spawn and shut down headless agents over
+MQTT. It listens on a dedicated spawn channel, forks `pi --mode rpc` processes
+(always loading the swarm extension so the new agent joins the swarm), tracks
+them, and can list/kill them. Headless agents stay alive on an open stdin and are
+driven entirely over MQTT by the extension.
+
+```bash
+# Run it (Node 24+ runs the .ts file directly)
+node src/console.ts --name host-1 --broker mqtt://127.0.0.1:1883
+# or
+npm run console -- --name host-1
+```
+
+Config (CLI flag wins over env): `--broker`/`PI_SWARM_BROKER`, `--ns`/`PI_SWARM_NS`,
+`--name`/`PI_SWARM_CONSOLE_NAME`, `--pi`/`PI_BIN` (default `pi`),
+`--extension`/`PI_SWARM_EXTENSION` (default `index.ts` beside the console).
+
+| Topic | Dir | Retained | Payload |
+|-------|-----|----------|---------|
+| `NS/console/in` | orch → console | – | `{ action, ... }` spawn/list/kill/ping |
+| `NS/console/out` | console → orch | – | replies + events (`spawn_result`, `agents`, `kill_result`, `exited`, `pong`, `error`) |
+| `NS/console/registry/CID` | console → all | ✅ + LWT | `{ type:"console", id, name, host, pid, agents:[...], ... }` |
+
+### Console actions (`NS/console/in`)
+
+```jsonc
+// Spawn a headless agent. All fields except action are optional.
+{ "action": "spawn",
+  "name": "coder-3",                          // --name (also the swarm id); omitted -> agent-<pid>
+  "model": "anthropic/claude-sonnet-4-5",     // --model
+  "extensions": ["./my-ext.ts", "npm:foo"],   // extra -e extensions (swarm ext auto-added)
+  "cwd": "/path/to/project",                  // working directory
+  "env": { "FOO": "bar" },                    // extra environment
+  "noSession": true,                          // --no-session (ephemeral)
+  "approve": true,                            // --approve (trust project for the run)
+  "includeSwarmExtension": false,             // opt out of auto-loading the swarm ext
+  "reqId": "abc" }                            // echoed back in spawn_result
+
+{ "action": "list" }                          // -> { type:"agents", agents:[...] }
+{ "action": "kill", "target": "coder-3" }     // SIGTERM by id / name / pid
+{ "action": "kill", "target": "all", "force": true }   // SIGKILL every agent
+{ "action": "kill", "target": "coder-3", "signal": "SIGINT" }
+{ "action": "ping" }                          // -> { type:"pong", agents: <count> }
+```
+
+The console spawns **multiple** agents concurrently (one child process each,
+tracked by swarm id) and rejects a spawn whose id is already running. `kill`
+sends the chosen signal (default `SIGTERM`, escalating to `SIGKILL` after 5s) and
+emits an `exited` event when the child actually stops. On its own shutdown
+(`SIGINT`/`SIGTERM`) the console terminates all spawned agents and clears its
+retained registry.
+
+```bash
+# Spawn two agents
+mosquitto_pub -h 127.0.0.1 -t 'swarm/console/in' \
+  -m '{"action":"spawn","name":"coder-1","model":"sonnet"}'
+mosquitto_pub -h 127.0.0.1 -t 'swarm/console/in' \
+  -m '{"action":"spawn","name":"reviewer","extensions":["./review-ext.ts"]}'
+
+# List / kill via MQTT
+mosquitto_pub -h 127.0.0.1 -t 'swarm/console/in' -m '{"action":"list"}'
+mosquitto_pub -h 127.0.0.1 -t 'swarm/console/in' -m '{"action":"kill","target":"coder-1"}'
+mosquitto_pub -h 127.0.0.1 -t 'swarm/console/in' -m '{"action":"kill","target":"all"}'
+
+# Watch console replies/events
+mosquitto_sub -h 127.0.0.1 -t 'swarm/console/out' -v
+```
 
 ## Message delivery model
 

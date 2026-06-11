@@ -24,7 +24,7 @@
  *   NS/agents/ID/in           inbound normal work  -> queued, delivered when idle
  *   NS/agents/ID/interrupt    inbound urgent work  -> delivered immediately
  *   NS/agents/ID/control      inbound control { action: set_model|reset|reload|ping }
- *   NS/agents/ID/out          outbound events (turn/agent summaries, results, acks)
+ *   NS/agents/ID/out          outbound events (locally-typed user input, turn/agent summaries, results, acks)
  *   NS/board                  shared broadcast board (all agents subscribe)
  */
 
@@ -110,7 +110,13 @@ export default function (pi: ExtensionAPI) {
 
 	const resolveIdentity = () => {
 		if (identityResolved) return;
-		const rawName = (pi.getFlag("swarm-name") as string | undefined) ?? process.env.PI_SWARM_NAME;
+		// Priority: explicit --swarm-name flag > PI_SWARM_NAME env > the pi
+		// session name (set via `pi --name xxxx`) > default agent-<pid>.
+		const rawName =
+			(pi.getFlag("swarm-name") as string | undefined) ??
+			process.env.PI_SWARM_NAME ??
+			pi.getSessionName?.() ??
+			undefined;
 		if (rawName) {
 			NAME = rawName;
 			ID = slug(rawName);
@@ -272,6 +278,53 @@ export default function (pi: ExtensionAPI) {
 
 	const setActive = (names: string[]) => pi.setActiveTools([...new Set(names)]);
 
+	// Tear down and re-establish the MQTT connection under the current identity.
+	// Used by rename when the slugified id (and therefore topics + Last-Will)
+	// changes, so subscriptions and the will follow the new id.
+	const reconnect = () => {
+		try {
+			client?.end(true);
+		} catch {
+			/* ignore */
+		}
+		client = null;
+		if (lastCtx) connect(lastCtx);
+	};
+
+	// Rename this agent. Always updates the human-facing NAME and the pi session
+	// name. When the slugified id changes (the default), topics move too: the
+	// stale retained registry entry is cleared and the client reconnects so
+	// subscriptions + Last-Will bind to the new id. Pass reslug=false to keep the
+	// id/topics stable and only change the display name.
+	const renameAgent = (rawName: string, reslug = true) => {
+		const trimmed = String(rawName ?? "").trim();
+		if (!trimmed) return { ok: false as const, error: "empty name" };
+
+		const previous = { name: NAME, id: ID };
+		NAME = trimmed;
+		pi.setSessionName?.(NAME);
+
+		const newId = reslug ? slug(trimmed) : ID;
+		const idChanged = newId !== ID;
+		if (idChanged) {
+			const oldRegistry = T.registry;
+			ID = newId;
+			T = topicsFor(NS, ID);
+			// Delete the stale retained registry entry under the old id (empty
+			// retained payload), then reconnect so the new id is fully wired up.
+			try {
+				client?.publish(oldRegistry, "", { qos: 1, retain: true });
+			} catch {
+				/* ignore */
+			}
+			reconnect();
+		} else {
+			publishRegistry(busy ? "busy" : "online");
+		}
+		if (lastCtx) updateStatusLine(lastCtx);
+		return { ok: true as const, name: NAME, id: ID, idChanged, previous };
+	};
+
 	const handleControl = async (msg: any) => {
 		const action = msg?.action;
 		switch (action) {
@@ -362,6 +415,29 @@ export default function (pi: ExtensionAPI) {
 					/* ignore */
 				}
 				reply({ type: "abort", ok: true, wasBusy });
+				return;
+			}
+
+			case "rename":
+			case "set_name": {
+				const wantName = String(msg.name ?? msg.text ?? "").trim();
+				const reslug = msg.reslug !== false;
+				if (!wantName) {
+					reply({ type: "rename_result", ok: false, error: "empty name" });
+					return;
+				}
+				const predictedId = reslug ? slug(wantName) : ID;
+				// Pre-ack on the *current* control/out. A reslug moves topics, so
+				// announce the new id/topics here before we switch over — the final
+				// rename_result is published on the new control/out.
+				reply({
+					type: "rename_ack",
+					request: { name: wantName, reslug },
+					newId: predictedId,
+					newTopics: topicsFor(NS, predictedId),
+				});
+				const result = renameAgent(wantName, reslug);
+				reply({ type: "rename_result", ...result });
 				return;
 			}
 
@@ -569,6 +645,27 @@ export default function (pi: ExtensionAPI) {
 		publishRegistry(busy ? "busy" : "online");
 		updateStatusLine(ctx);
 		pub(T.controlOut, { id: ID, type: "model_select", model, source: event.source, ts: Date.now() });
+	});
+
+	// Mirror locally-typed (and RPC) user input over MQTT, so the orchestrator
+	// sees what an operator entered directly into the TUI. Skip "extension"
+	// source: those messages originate from inbound MQTT work we injected via
+	// sendUserMessage, and re-publishing them would echo back to the swarm.
+	pi.on("input", async (event: any) => {
+		if (event?.source === "extension") return { action: "continue" };
+		const text = typeof event?.text === "string" ? event.text : "";
+		if (text) {
+			pub(T.out, {
+				type: "user_input",
+				id: ID,
+				text,
+				source: event?.source ?? "interactive",
+				streamingBehavior: event?.streamingBehavior ?? null,
+				images: Array.isArray(event?.images) ? event.images.length : 0,
+				ts: Date.now(),
+			});
+		}
+		return { action: "continue" };
 	});
 
 	pi.on("agent_start", async (_event: any, ctx: any) => {
