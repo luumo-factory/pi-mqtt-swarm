@@ -70,13 +70,26 @@ function lastAssistantText(messages: any[]): string | null {
 function topicsFor(ns: string, id: string) {
 	return {
 		registry: `${ns}/registry/${id}`,
+		// Work / data plane
 		in: `${ns}/agents/${id}/in`,
 		interrupt: `${ns}/agents/${id}/interrupt`,
-		control: `${ns}/agents/${id}/control`,
 		out: `${ns}/agents/${id}/out`,
+		// Control plane (dedicated in/out pair)
+		controlIn: `${ns}/agents/${id}/control/in`,
+		controlOut: `${ns}/agents/${id}/control/out`,
 		board: `${ns}/board`,
 	};
 }
+
+type ExtInfo = {
+	id: string;
+	source: string;
+	scope?: string;
+	origin?: string;
+	tools: string[];
+	commands: string[];
+	active: boolean;
+};
 
 type ModelInfo = { provider: string; id: string; name?: string } | null;
 type BoardPost = { seq: number; from: { id: string; name: string }; text: string; urgent: boolean; ts: number };
@@ -114,6 +127,7 @@ export default function (pi: ExtensionAPI) {
 	let model: ModelInfo = null;
 	let modelRegistry: any = null; // captured from latest session ctx
 	let availableModels: { provider: string; id: string; name?: string }[] = [];
+	let lastCtx: any = null; // most recent context, used for ctx.abort()
 	const queue: string[] = []; // normal inbound, awaiting idle
 	const board: BoardPost[] = []; // local mirror of board history
 	let boardSeq = 0;
@@ -130,6 +144,38 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
+	// Group registered tools + commands by their owning extension. pi exposes
+	// runtime control at tool granularity, so an extension is considered "active"
+	// when all of the tools it registered are currently active.
+	const listExtensions = (): ExtInfo[] => {
+		const active = new Set(pi.getActiveTools());
+		const groups = new Map<string, ExtInfo>();
+		const get = (si: any): ExtInfo => {
+			const key = si?.path ?? si?.source ?? "unknown";
+			let g = groups.get(key);
+			if (!g) {
+				g = { id: key, source: si?.source ?? "extension", scope: si?.scope, origin: si?.origin, tools: [], commands: [], active: true };
+				groups.set(key, g);
+			}
+			return g;
+		};
+		for (const t of pi.getAllTools()) {
+			const si = (t as any).sourceInfo;
+			if (!si || si.source === "builtin" || si.source === "sdk") continue;
+			get(si).tools.push(t.name);
+		}
+		for (const c of pi.getCommands()) {
+			if ((c as any).source !== "extension") continue;
+			get((c as any).sourceInfo).commands.push(c.name);
+		}
+		return [...groups.values()].map((g) => ({
+			...g,
+			active: g.tools.length === 0 ? true : g.tools.every((n) => active.has(n)),
+		}));
+	};
+
+	const toolSummary = () => ({ active: pi.getActiveTools(), available: pi.getAllTools().map((t) => t.name) });
+
 	const publishRegistry = (status: "online" | "busy" | "idle" | "offline") => {
 		pub(
 			T.registry,
@@ -139,6 +185,8 @@ export default function (pi: ExtensionAPI) {
 				status,
 				model,
 				availableModels,
+				extensions: listExtensions(),
+				tools: toolSummary(),
 				pid: process.pid,
 				cwd: process.cwd(),
 				startedAt,
@@ -204,19 +252,42 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	// -----------------------------------------------------------------------
-	// Control actions (points 8/9/10)
+	// Control plane: replies go to T.controlOut
 	// -----------------------------------------------------------------------
+	const reply = (payload: Record<string, unknown>) => pub(T.controlOut, { id: ID, ts: Date.now(), ...payload });
+
+	// Resolve `extension` arg (path / basename / source substring) to the matching
+	// extension groups, and return the union of tools they registered.
+	const resolveExtensionTools = (arg: string): { matched: ExtInfo[]; tools: string[] } => {
+		const q = String(arg).toLowerCase();
+		const matched = listExtensions().filter(
+			(e) =>
+				e.id.toLowerCase().includes(q) ||
+				e.source.toLowerCase().includes(q) ||
+				e.id.split(/[\\/]/).pop()?.toLowerCase().includes(q),
+		);
+		const tools = [...new Set(matched.flatMap((e) => e.tools))];
+		return { matched, tools };
+	};
+
+	const setActive = (names: string[]) => pi.setActiveTools([...new Set(names)]);
+
 	const handleControl = async (msg: any) => {
 		const action = msg?.action;
 		switch (action) {
 			case "ping":
 				publishRegistry(busy ? "busy" : "online");
-				pub(T.out, { type: "pong", id: ID, ts: Date.now() });
+				reply({ type: "pong" });
+				return;
+
+			case "status":
+				publishRegistry(busy ? "busy" : "online");
+				reply({ type: "status", status: busy ? "busy" : "idle", model, extensions: listExtensions(), tools: toolSummary() });
 				return;
 
 			case "set_model": {
 				if (!modelRegistry) {
-					pub(T.out, { type: "set_model_result", ok: false, error: "no model registry", ts: Date.now() });
+					reply({ type: "set_model_result", ok: false, error: "no model registry" });
 					return;
 				}
 				let target: any = null;
@@ -230,32 +301,82 @@ export default function (pi: ExtensionAPI) {
 						available.find((m: any) => m.id?.toLowerCase().includes(q) || m.name?.toLowerCase().includes(q));
 				}
 				if (!target) {
-					pub(T.out, { type: "set_model_result", ok: false, error: "model not found", request: msg, ts: Date.now() });
+					reply({ type: "set_model_result", ok: false, error: "model not found", request: msg });
 					return;
 				}
 				const ok = await pi.setModel(target);
-				pub(T.out, {
+				reply({
 					type: "set_model_result",
 					ok,
 					model: ok ? { provider: target.provider, id: target.id, name: target.name } : null,
 					error: ok ? undefined : "no API key for model",
-					ts: Date.now(),
 				});
 				return;
 			}
 
+			case "list_extensions":
+				reply({ type: "extensions", extensions: listExtensions(), tools: toolSummary() });
+				return;
+
+			case "enable_extension":
+			case "disable_extension": {
+				const enabling = action === "enable_extension";
+				const { matched, tools } = resolveExtensionTools(msg.extension ?? "");
+				if (matched.length === 0) {
+					reply({ type: "extension_toggle", ok: false, error: `no extension matched: ${msg.extension}` });
+					return;
+				}
+				const current = pi.getActiveTools();
+				setActive(enabling ? [...current, ...tools] : current.filter((n) => !tools.includes(n)));
+				publishRegistry(busy ? "busy" : "online");
+				reply({
+					type: "extension_toggle",
+					ok: true,
+					enabled: enabling,
+					matched: matched.map((e) => e.id),
+					toolsAffected: tools,
+					extensions: listExtensions(),
+				});
+				return;
+			}
+
+			case "enable_tools":
+			case "disable_tools":
+			case "set_active_tools": {
+				const names: string[] = Array.isArray(msg.tools) ? msg.tools : [];
+				const current = pi.getActiveTools();
+				const next =
+					action === "set_active_tools" ? names : action === "enable_tools" ? [...current, ...names] : current.filter((n) => !names.includes(n));
+				setActive(next);
+				publishRegistry(busy ? "busy" : "online");
+				reply({ type: "tools", action, tools: toolSummary() });
+				return;
+			}
+
+			case "abort":
+			case "interrupt": {
+				const wasBusy = busy;
+				try {
+					lastCtx?.abort?.();
+				} catch {
+					/* ignore */
+				}
+				reply({ type: "abort", ok: true, wasBusy });
+				return;
+			}
+
 			case "reset":
-				pub(T.out, { type: "ack", action: "reset", ts: Date.now() });
+				reply({ type: "ack", action: "reset" });
 				invokeCommand("swarm-reset");
 				return;
 
 			case "reload":
-				pub(T.out, { type: "ack", action: "reload", ts: Date.now() });
+				reply({ type: "ack", action: "reload" });
 				invokeCommand("swarm-reload");
 				return;
 
 			default:
-				pub(T.out, { type: "error", error: `unknown control action: ${action}`, ts: Date.now() });
+				reply({ type: "error", error: `unknown control action: ${action}` });
 		}
 	};
 
@@ -276,7 +397,7 @@ export default function (pi: ExtensionAPI) {
 		});
 
 		client.on("connect", () => {
-			client!.subscribe([T.in, T.interrupt, T.control, T.board], { qos: 1 });
+			client!.subscribe([T.in, T.interrupt, T.controlIn, T.board], { qos: 1 });
 			publishRegistry(busy ? "busy" : "online");
 			updateStatusLine(ctx);
 		});
@@ -301,7 +422,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			if (topic === T.control) {
+			if (topic === T.controlIn) {
 				void handleControl(msg);
 				return;
 			}
@@ -422,6 +543,7 @@ export default function (pi: ExtensionAPI) {
 	// -----------------------------------------------------------------------
 	pi.on("session_start", async (_event: any, ctx: any) => {
 		resolveIdentity();
+		lastCtx = ctx;
 		modelRegistry = ctx.modelRegistry ?? null;
 		const m = ctx.model;
 		model = m ? { provider: m.provider, id: m.id, name: m.name } : model;
@@ -446,10 +568,11 @@ export default function (pi: ExtensionAPI) {
 		model = m ? { provider: m.provider, id: m.id, name: m.name } : model;
 		publishRegistry(busy ? "busy" : "online");
 		updateStatusLine(ctx);
-		pub(T.out, { type: "model_select", model, source: event.source, ts: Date.now() });
+		pub(T.controlOut, { id: ID, type: "model_select", model, source: event.source, ts: Date.now() });
 	});
 
 	pi.on("agent_start", async (_event: any, ctx: any) => {
+		lastCtx = ctx;
 		busy = true;
 		publishRegistry("busy");
 		updateStatusLine(ctx);

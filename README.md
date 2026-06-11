@@ -54,35 +54,66 @@ PI_SWARM_BROKER=mqtt://127.0.0.1:1883 pi --swarm-name reviewer
 
 `NS` = namespace (default `swarm`), `ID` = slugified agent id.
 
+`NS` = namespace (default `swarm`), `ID` = slugified agent id. There are two
+planes: a **work/data plane** (`in` / `interrupt` / `out`) and a dedicated
+**control plane** (`control/in` / `control/out`).
+
 | Topic | Dir | Retained | Payload |
 |-------|-----|----------|---------|
-| `NS/registry/ID` | agent → all | ✅ + LWT | `{ id, name, status, model, availableModels, pid, cwd, startedAt, ts }` |
+| `NS/registry/ID` | agent → all | ✅ + LWT | `{ id, name, status, model, availableModels, extensions, tools, pid, cwd, startedAt, ts }` |
 | `NS/agents/ID/in` | orch → agent | – | `{ text }` or raw string — **queued, delivered when idle** |
-| `NS/agents/ID/interrupt` | orch → agent | – | `{ text }` or raw string — **delivered immediately** |
-| `NS/agents/ID/control` | orch → agent | – | `{ action, ... }` (see below) |
-| `NS/agents/ID/out` | agent → orch | – | event stream (turn/agent summaries, acks, results) |
+| `NS/agents/ID/interrupt` | orch → agent | – | `{ text }` or raw string — urgent message **injected immediately** (steers the turn) |
+| `NS/agents/ID/out` | agent → orch | – | work event stream (agent/turn summaries, session reset/reload) |
+| `NS/agents/ID/control/in` | orch → agent | – | `{ action, ... }` control commands (see below) |
+| `NS/agents/ID/control/out` | agent → orch | – | control replies (acks, results, model/extension/tool state) |
 | `NS/board` | any → all | – | `{ seq, from:{id,name}, text, urgent, ts }` |
+
+> **Two kinds of "interrupt":** `NS/agents/ID/interrupt` *injects* an urgent
+> message into the running turn (steering). The control action `abort` (below)
+> *cancels* the running turn entirely (`ctx.abort()`).
 
 `status` is one of `online` \| `busy` \| `idle` \| `offline`. The broker
 publishes `offline` automatically via MQTT Last-Will if an agent dies.
 
 `model` is the currently active model `{ provider, id, name }`. `availableModels`
 is the list of models this agent can actually switch to (those with valid
-credentials), each `{ provider, id, name }` — useful for an orchestrator UI that
-offers per-agent model selection and validates `set_model` requests.
+credentials), each `{ provider, id, name }`.
 
-### Control actions (`NS/agents/ID/control`)
+`extensions` lists the agent's loaded extensions (those contributing tools or
+commands), each `{ id, source, scope, origin, tools, commands, active }`. `active`
+reflects whether all of that extension's tools are currently active. `tools` is
+`{ active, available }` (tool-name arrays) for fine-grained control. (pi has no
+runtime extension on/off switch, so enabling/disabling an extension toggles the
+tools it registered.)
+
+### Control actions (`NS/agents/ID/control/in`)
 
 ```jsonc
 { "action": "ping" }                                  // re-publish registry + pong
+{ "action": "status" }                                // full status on control/out
+
+// Model
 { "action": "set_model", "provider": "anthropic",     // switch model (explicit)
   "modelId": "claude-sonnet-4-5" }
 { "action": "set_model", "query": "gpt-4o" }          // switch model (fuzzy)
+
+// Interrupt the running turn
+{ "action": "abort" }                                 // alias: "interrupt"
+
+// Extensions / tools
+{ "action": "list_extensions" }
+{ "action": "disable_extension", "extension": "plan-mode" }   // path/basename/source match
+{ "action": "enable_extension",  "extension": "plan-mode" }
+{ "action": "disable_tools", "tools": ["read_board"] }
+{ "action": "enable_tools",  "tools": ["read_board"] }
+{ "action": "set_active_tools", "tools": ["read","bash","edit","write"] }
+
+// Session lifecycle
 { "action": "reset" }                                 // fresh conversation/context
 { "action": "reload" }                                // reload extensions/skills/etc
 ```
 
-Results/acks are published to `NS/agents/ID/out`.
+Replies are published to `NS/agents/ID/control/out`.
 
 ## Message delivery model
 
@@ -115,21 +146,31 @@ mosquitto_sub -h 127.0.0.1 -t 'swarm/#' -v
 # Discover agents (retained registrations)
 mosquitto_sub -h 127.0.0.1 -t 'swarm/registry/#' -v
 
+# Watch control replies
+mosquitto_sub -h 127.0.0.1 -t 'swarm/agents/coder-1/control/out' -v
+
 # Send work (queued until idle)
 mosquitto_pub -h 127.0.0.1 -t 'swarm/agents/coder-1/in' \
   -m '{"text":"Refactor src/auth into smaller modules"}'
 
-# Interrupt now
+# Inject an urgent message into the running turn
 mosquitto_pub -h 127.0.0.1 -t 'swarm/agents/coder-1/interrupt' \
   -m '{"text":"Stop — the API contract just changed"}'
 
+# Cancel the running turn entirely
+mosquitto_pub -h 127.0.0.1 -t 'swarm/agents/coder-1/control/in' -m '{"action":"abort"}'
+
 # Change model
-mosquitto_pub -h 127.0.0.1 -t 'swarm/agents/coder-1/control' \
+mosquitto_pub -h 127.0.0.1 -t 'swarm/agents/coder-1/control/in' \
   -m '{"action":"set_model","query":"sonnet"}'
 
+# Disable / enable an extension (by path, basename, or source substring)
+mosquitto_pub -h 127.0.0.1 -t 'swarm/agents/coder-1/control/in' \
+  -m '{"action":"disable_extension","extension":"plan-mode"}'
+
 # Reset context / reload
-mosquitto_pub -h 127.0.0.1 -t 'swarm/agents/coder-1/control' -m '{"action":"reset"}'
-mosquitto_pub -h 127.0.0.1 -t 'swarm/agents/coder-1/control' -m '{"action":"reload"}'
+mosquitto_pub -h 127.0.0.1 -t 'swarm/agents/coder-1/control/in' -m '{"action":"reset"}'
+mosquitto_pub -h 127.0.0.1 -t 'swarm/agents/coder-1/control/in' -m '{"action":"reload"}'
 
 # Broadcast a fact to the whole swarm
 mosquitto_pub -h 127.0.0.1 -t 'swarm/board' \

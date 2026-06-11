@@ -1,6 +1,6 @@
 {
   "name": "pi-mqtt-swarm",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Coordinate a swarm of pi coding agents over MQTT: central orchestration, per-agent in/out queues, status overview, a shared message board, and remote model/reset/reload control.",
   "license": "MIT",
   "keywords": [
