@@ -56,7 +56,7 @@ PI_SWARM_BROKER=mqtt://127.0.0.1:1883 pi --swarm-name reviewer
 
 | Topic | Dir | Retained | Payload |
 |-------|-----|----------|---------|
-| `NS/registry/ID` | agent → all | ✅ + LWT | `{ id, name, status, model, pid, cwd, startedAt, ts }` |
+| `NS/registry/ID` | agent → all | ✅ + LWT | `{ id, name, status, model, availableModels, pid, cwd, startedAt, ts }` |
 | `NS/agents/ID/in` | orch → agent | – | `{ text }` or raw string — **queued, delivered when idle** |
 | `NS/agents/ID/interrupt` | orch → agent | – | `{ text }` or raw string — **delivered immediately** |
 | `NS/agents/ID/control` | orch → agent | – | `{ action, ... }` (see below) |
@@ -65,6 +65,11 @@ PI_SWARM_BROKER=mqtt://127.0.0.1:1883 pi --swarm-name reviewer
 
 `status` is one of `online` \| `busy` \| `idle` \| `offline`. The broker
 publishes `offline` automatically via MQTT Last-Will if an agent dies.
+
+`model` is the currently active model `{ provider, id, name }`. `availableModels`
+is the list of models this agent can actually switch to (those with valid
+credentials), each `{ provider, id, name }` — useful for an orchestrator UI that
+offers per-agent model selection and validates `set_model` requests.
 
 ### Control actions (`NS/agents/ID/control`)
 

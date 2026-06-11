@@ -113,6 +113,7 @@ export default function (pi: ExtensionAPI) {
 	let busy = false; // true between agent_start and agent_end
 	let model: ModelInfo = null;
 	let modelRegistry: any = null; // captured from latest session ctx
+	let availableModels: { provider: string; id: string; name?: string }[] = [];
 	const queue: string[] = []; // normal inbound, awaiting idle
 	const board: BoardPost[] = []; // local mirror of board history
 	let boardSeq = 0;
@@ -137,6 +138,7 @@ export default function (pi: ExtensionAPI) {
 				name: NAME,
 				status,
 				model,
+				availableModels,
 				pid: process.pid,
 				cwd: process.cwd(),
 				startedAt,
@@ -144,6 +146,16 @@ export default function (pi: ExtensionAPI) {
 			},
 			{ qos: 1, retain: true },
 		);
+	};
+
+	// Cache the models this agent can actually use (those with valid credentials).
+	const refreshAvailableModels = async () => {
+		try {
+			const list = (await modelRegistry?.getAvailable?.()) ?? [];
+			availableModels = list.map((m: any) => ({ provider: m.provider, id: m.id, name: m.name }));
+		} catch {
+			/* leave previous list in place on failure */
+		}
 	};
 
 	const updateStatusLine = (ctx: any) => {
@@ -414,6 +426,7 @@ export default function (pi: ExtensionAPI) {
 		const m = ctx.model;
 		model = m ? { provider: m.provider, id: m.id, name: m.name } : model;
 		if (pi.getSessionName?.() == null) pi.setSessionName?.(NAME);
+		await refreshAvailableModels(); // populate before the first registry publish
 		connect(ctx);
 		updateStatusLine(ctx);
 	});
