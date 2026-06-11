@@ -301,16 +301,29 @@ function handleKill(req: any) {
 // Command dispatch
 // ---------------------------------------------------------------------------
 
+// Whether a command is addressed to this console. Several consoles share the
+// NS/console/in topic, so spawn/kill may carry a `console` field naming the
+// target host; when present and not matching us, we ignore the command. list/
+// ping are unaddressed so every console answers (for discovery).
+function addressedToMe(msg: any): boolean {
+	const target = msg?.console;
+	if (target === undefined || target === null || target === "") return true;
+	const t = String(target);
+	return t === CONSOLE_ID || slug(t) === CONSOLE_ID;
+}
+
 function handleCommand(msg: any) {
 	const action = msg?.action;
 	switch (action) {
 		case "spawn":
+			if (!addressedToMe(msg)) return;
 			handleSpawn(msg);
 			return;
 		case "list":
 			reply({ type: "agents", reqId: msg.reqId, agents: [...agents.values()].map(agentView) });
 			return;
 		case "kill":
+			if (!addressedToMe(msg)) return;
 			handleKill(msg);
 			return;
 		case "ping":

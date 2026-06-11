@@ -160,6 +160,7 @@ Config (CLI flag wins over env): `--broker`/`PI_SWARM_BROKER`, `--ns`/`PI_SWARM_
 ```jsonc
 // Spawn a headless agent. All fields except action are optional.
 { "action": "spawn",
+  "console": "host-1",                        // target console id; omitted -> every console acts
   "name": "coder-3",                          // --name (also the swarm id); omitted -> agent-<pid>
   "model": "anthropic/claude-sonnet-4-5",     // --model
   "extensions": ["./my-ext.ts", "npm:foo"],   // extra -e extensions (swarm ext auto-added)
@@ -176,6 +177,11 @@ Config (CLI flag wins over env): `--broker`/`PI_SWARM_BROKER`, `--ns`/`PI_SWARM_
 { "action": "kill", "target": "coder-3", "signal": "SIGINT" }
 { "action": "ping" }                          // -> { type:"pong", agents: <count> }
 ```
+
+When several consoles run on different hosts they share `NS/console/in`, so
+`spawn` and `kill` may include a `console` field naming the target console id
+(from its `NS/console/registry/CID`); only the matching console acts, while
+unaddressed `list`/`ping` are answered by every console for discovery.
 
 The console spawns **multiple** agents concurrently (one child process each,
 tracked by swarm id) and rejects a spawn whose id is already running. `kill`
