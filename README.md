@@ -111,6 +111,7 @@ tools it registered.)
 // Session lifecycle
 { "action": "reset" }                                 // fresh conversation/context
 { "action": "reload" }                                // reload extensions/skills/etc
+{ "action": "quit" }                                  // graceful shutdown, like /quit (alias: "shutdown")
 
 // Rename this agent (alias: "set_name")
 { "action": "rename", "name": "coder-2" }             // rename + reslug id/topics (default)

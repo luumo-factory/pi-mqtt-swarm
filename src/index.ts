@@ -223,14 +223,49 @@ export default function (pi: ExtensionAPI) {
 	// -----------------------------------------------------------------------
 	// Everything destined for the LLM funnels through here. Normal traffic is
 	// buffered and flushed when the agent is idle; urgent traffic bypasses.
+	// Whether the agent is actually streaming *right now*. Our `busy` flag only
+	// flips on agent_start/agent_end, so it's briefly stale — e.g. just after we
+	// trigger a turn (before agent_start fires) or while the operator is typing
+	// directly into the TUI. ctx.isIdle() reflects pi's real state, so prefer it
+	// when we have a context, falling back to the flag otherwise.
+	const agentStreaming = () => {
+		if (typeof lastCtx?.isIdle === "function") {
+			try {
+				return !lastCtx.isIdle();
+			} catch {
+				/* fall back to the flag */
+			}
+		}
+		return busy;
+	};
+
+	// Send a user message, choosing immediate vs. queued delivery from the
+	// agent's real state. If pi still reports "already processing" (a race we
+	// lost between the check and the send), retry with the queued behavior so the
+	// message is never dropped and the error never surfaces in the TUI.
+	const deliver = (content: string, queued: "steer" | "followUp") => {
+		const opts = agentStreaming() ? { deliverAs: queued } : undefined;
+		try {
+			pi.sendUserMessage(content, opts);
+		} catch {
+			if (!opts) {
+				try {
+					pi.sendUserMessage(content, { deliverAs: queued });
+				} catch {
+					/* give up: agent state is unrecoverable for this message */
+				}
+			}
+		}
+	};
+
 	const flush = () => {
-		if (busy || queue.length === 0) return;
+		if (agentStreaming() || queue.length === 0) return;
 		const batch = queue.splice(0, queue.length);
 		const text =
 			batch.length === 1
 				? batch[0]
 				: `You have ${batch.length} queued swarm messages:\n` + batch.map((m, i) => `${i + 1}. ${m}`).join("\n");
-		pi.sendUserMessage(text); // idle -> triggers a fresh turn
+		deliver(text, "followUp"); // idle -> triggers a fresh turn
 	};
 
 	// A slash command is a single-line message whose first non-whitespace
@@ -245,9 +280,7 @@ export default function (pi: ExtensionAPI) {
 
 	// Deliver a slash command verbatim. Mid-stream it's queued as a followUp
 	// (commands can't be steered); idle, it runs immediately and triggers a turn.
-	const deliverCommand = (text: string) => {
-		pi.sendUserMessage(text.trim(), busy ? { deliverAs: "followUp" } : undefined);
-	};
+	const deliverCommand = (text: string) => deliver(text.trim(), "followUp");
 
 	const enqueue = (text: string, urgent: boolean) => {
 		// Slash commands bypass wrapping/batching so pi runs them as commands.
@@ -257,11 +290,11 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (urgent) {
 			// Deliver now; steer if mid-stream, otherwise it triggers a turn.
-			pi.sendUserMessage(`[URGENT] ${text}`, busy ? { deliverAs: "steer" } : undefined);
+			deliver(`[URGENT] ${text}`, "steer");
 			return;
 		}
 		queue.push(text);
-		if (!busy) flush();
+		if (!agentStreaming()) flush();
 	};
 
 	// Invoke one of our own slash commands as a user message (documented pattern
@@ -469,6 +502,27 @@ export default function (pi: ExtensionAPI) {
 				reply({ type: "ack", action: "reload" });
 				invokeCommand("swarm-reload");
 				return;
+
+			case "quit":
+			case "shutdown": {
+				// Graceful shutdown, equivalent to the in-TUI /quit command.
+				reply({ type: "ack", action: "quit" });
+				if (typeof lastCtx?.shutdown === "function") {
+					lastCtx.shutdown();
+				} else {
+					// No context yet: clear our retained registry and exit directly.
+					try {
+						client?.publish(T.registry, JSON.stringify({ id: ID, name: NAME, status: "offline", ts: Date.now() }), {
+							qos: 1,
+							retain: true,
+						});
+					} catch {
+						/* ignore */
+					}
+					setTimeout(() => process.exit(0), 100).unref?.();
+				}
+				return;
+			}
 
 			default:
 				reply({ type: "error", error: `unknown control action: ${action}` });

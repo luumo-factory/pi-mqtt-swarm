@@ -189,15 +189,31 @@ function buildArgs(req: any): { args: string[]; extensions: string[]; name?: str
 }
 
 function handleSpawn(req: any) {
-	const { args, extensions, name, model } = buildArgs(req);
-	const resolvedName = name ?? `agent-pending`;
-	const id = name ? slug(name) : null;
+	const { args, extensions, name: requestedName, model } = buildArgs(req);
+	let name: string | undefined = requestedName;
+	let id: string | null = name ? slug(name) : null;
 
-	// Reject collisions on a known id: two agents sharing an id would collide on
-	// every NS/agents/ID/* topic.
+	// If name is provided and it's a duplicate, append a hyphen and an incrementing integer.
 	if (id && agents.has(id)) {
-		reply({ type: "spawn_result", ok: false, error: `agent id already running: ${id}`, reqId: req.reqId });
-		return;
+		let counter = 1;
+		let newName = `${name}-${counter}`;
+		let newId = slug(newName);
+
+		while (agents.has(newId)) {
+			counter++;
+			newName = `${name}-${counter}`;
+			newId = slug(newName);
+		}
+		name = newName;
+		id = newId;
+
+		// Update the args to use the new name
+		const nameIndex = args.indexOf("--name");
+		if (nameIndex !== -1) {
+			args[nameIndex + 1] = name;
+		} else {
+			args.push("--name", name);
+		}
 	}
 
 	const cwd = req.cwd ? String(req.cwd) : process.cwd();
